@@ -1,6 +1,11 @@
 const nodemailer = require('nodemailer');
 const randomstring = require('randomstring');
-const OTP = require('../models/OTP');
+
+// Airtable Configuration for Houston 100
+const AIRTABLE_BASE_ID = 'appaOZzwTAultlr23';
+const AIRTABLE_TOKEN = 'patHd0JCviTampMds.ab1b932899944e6b78bc16d584db8cdd1b8386e362518c847808a9e6fbdc48e9';
+const OTP_TABLE_NAME = 'OTP_Codes';
+const AIRTABLE_OTP_URL = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${OTP_TABLE_NAME}`;
 
 // Configure Nodemailer for Houston 100
 const transporter = nodemailer.createTransporter({
@@ -22,6 +27,81 @@ transporter.verify((error, success) => {
   }
 });
 
+// Airtable Helper Functions
+async function createOTPRecord(email, otpCode, expiresAt) {
+  const response = await fetch(AIRTABLE_OTP_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${AIRTABLE_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      fields: {
+        Email: email,
+        OTP: otpCode,
+        ExpiresAt: expiresAt.toISOString(),
+        Attempts: 0,
+        CreatedAt: new Date().toISOString(),
+        Status: 'Active'
+      }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Airtable error: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+async function findOTPRecord(email) {
+  const filterFormula = `{Email} = '${email}'`;
+  const response = await fetch(`${AIRTABLE_OTP_URL}?filterByFormula=${encodeURIComponent(filterFormula)}`, {
+    headers: {
+      'Authorization': `Bearer ${AIRTABLE_TOKEN}`
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Airtable error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.records.length > 0 ? data.records[0] : null;
+}
+
+async function updateOTPRecord(recordId, fields) {
+  const response = await fetch(`${AIRTABLE_OTP_URL}/${recordId}`, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${AIRTABLE_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ fields })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Airtable error: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
+async function deleteOTPRecord(recordId) {
+  const response = await fetch(`${AIRTABLE_OTP_URL}/${recordId}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${AIRTABLE_TOKEN}`
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Airtable error: ${response.status}`);
+  }
+
+  return await response.json();
+}
+
 // Generate and send OTP
 exports.generateOTP = async (req, res) => {
   try {
@@ -36,12 +116,20 @@ exports.generateOTP = async (req, res) => {
     }
 
     // Check if user is authorized for Houston 100
-    const authorizedDomains = ['houston100.org', 'gmail.com']; // Add your domains
-    const emailDomain = email.split('@')[1];
-    
-    // For demo, allow common domains, but log for review
-    if (!authorizedDomains.includes(emailDomain)) {
-      console.warn(`⚠️ Non-Houston100 domain attempted: ${email}`);
+    const authorizedEmails = [
+      'effram@houston100.org',
+      'quintin@houston100.org',
+      'william@houston100.org',
+      'demo@houston100.org',
+      'test@houston100.org'
+    ];
+
+    if (!authorizedEmails.includes(email.toLowerCase())) {
+      console.warn(`⚠️ Unauthorized email attempted: ${email}`);
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. Please contact Houston 100 administration.'
+      });
     }
 
     // Generate 6-digit OTP
@@ -54,21 +142,17 @@ exports.generateOTP = async (req, res) => {
     const expiryTime = new Date(Date.now() + (parseInt(process.env.OTP_EXPIRY) || 300000));
 
     // Delete any existing OTP for this email
-    await OTP.deleteMany({ email });
+    const existingRecord = await findOTPRecord(email);
+    if (existingRecord) {
+      await deleteOTPRecord(existingRecord.id);
+    }
 
-    // Save new OTP to database
-    const otp = new OTP({
-      email,
-      otp: otpCode,
-      expiresAt: expiryTime,
-      attempts: 0
-    });
-
-    await otp.save();
+    // Save new OTP to Airtable
+    await createOTPRecord(email, otpCode, expiryTime);
 
     // Houston 100 Email Template
     const emailTemplate = {
-      from: process.env.FROM_EMAIL,
+      from: process.env.FROM_EMAIL || 'Houston 100 Security <noreply@houston100.org>',
       to: email,
       subject: '🔐 Houston 100 - Your Verification Code',
       html: `
@@ -118,7 +202,7 @@ exports.generateOTP = async (req, res) => {
             <div class="footer">
               <p>Houston 100 Investment Group LLC<br>
               Kingdom-focused Financial Stewardship<br>
-              <a href="mailto:${process.env.SUPPORT_EMAIL}">${process.env.SUPPORT_EMAIL}</a></p>
+              <a href="mailto:support@houston100.org">support@houston100.org</a></p>
             </div>
           </div>
         </body>
@@ -134,14 +218,14 @@ This code expires in 5 minutes.
 If you didn't request this code, please ignore this email.
 
 Houston 100 Investment Group LLC
-${process.env.SUPPORT_EMAIL}
+support@houston100.org
       `
     };
 
     // Send email
     await transporter.sendMail(emailTemplate);
 
-    console.log(`✅ OTP sent to ${email}: ${otpCode}`);
+    console.log(`✅ OTP sent to ${email}: ${otpCode} (stored in Airtable)`);
 
     res.status(200).json({
       success: true,
@@ -172,8 +256,8 @@ exports.verifyOTP = async (req, res) => {
       });
     }
 
-    // Find OTP record
-    const otpRecord = await OTP.findOne({ email });
+    // Find OTP record in Airtable
+    const otpRecord = await findOTPRecord(email);
 
     if (!otpRecord) {
       return res.status(404).json({
@@ -182,9 +266,11 @@ exports.verifyOTP = async (req, res) => {
       });
     }
 
+    const fields = otpRecord.fields;
+
     // Check if OTP has expired
-    if (new Date() > otpRecord.expiresAt) {
-      await OTP.deleteOne({ email });
+    if (new Date() > new Date(fields.ExpiresAt)) {
+      await deleteOTPRecord(otpRecord.id);
       return res.status(400).json({
         success: false,
         message: 'Verification code has expired. Please request a new code.'
@@ -192,8 +278,8 @@ exports.verifyOTP = async (req, res) => {
     }
 
     // Check attempts (prevent brute force)
-    if (otpRecord.attempts >= 3) {
-      await OTP.deleteOne({ email });
+    if (fields.Attempts >= 3) {
+      await deleteOTPRecord(otpRecord.id);
       return res.status(429).json({
         success: false,
         message: 'Too many failed attempts. Please request a new code.'
@@ -201,21 +287,22 @@ exports.verifyOTP = async (req, res) => {
     }
 
     // Verify OTP
-    if (otpRecord.otp !== otp) {
+    if (fields.OTP !== otp) {
       // Increment attempts
-      otpRecord.attempts += 1;
-      await otpRecord.save();
+      await updateOTPRecord(otpRecord.id, {
+        Attempts: fields.Attempts + 1
+      });
 
       return res.status(400).json({
         success: false,
-        message: `Invalid verification code. ${3 - otpRecord.attempts} attempts remaining.`
+        message: `Invalid verification code. ${3 - (fields.Attempts + 1)} attempts remaining.`
       });
     }
 
     // OTP is valid - delete it and grant access
-    await OTP.deleteOne({ email });
+    await deleteOTPRecord(otpRecord.id);
 
-    console.log(`✅ OTP verified successfully for ${email}`);
+    console.log(`✅ OTP verified successfully for ${email} (Airtable)`);
 
     res.status(200).json({
       success: true,
@@ -244,7 +331,7 @@ exports.getOTPStatus = async (req, res) => {
   try {
     const { email } = req.params;
     
-    const otpRecord = await OTP.findOne({ email });
+    const otpRecord = await findOTPRecord(email);
     
     if (!otpRecord) {
       return res.status(404).json({
@@ -257,8 +344,8 @@ exports.getOTPStatus = async (req, res) => {
       success: true,
       email: email,
       hasActiveOTP: true,
-      expiresAt: otpRecord.expiresAt,
-      attempts: otpRecord.attempts
+      expiresAt: otpRecord.fields.ExpiresAt,
+      attempts: otpRecord.fields.Attempts
     });
     
   } catch (error) {
